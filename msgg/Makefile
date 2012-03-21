@@ -1,8 +1,10 @@
-CFLAGS=-Wall -Wextra -Werror -I/usr/include/libpurple -I/usr/include/glib-2.0 -I/usr/lib/i386-linux-gnu/glib-2.0/include -g --std=gnu99 -D_GNU_SOURCE
+CFLAGS=-Wall -Wextra -Werror -I/usr/include/libpurple -g --std=gnu99 -D_GNU_SOURCE
 
 all: msgg msg_send
 
 msgg: LDLIBS+=-lpurple -lbsd
+msgg: CFLAGS+=$(shell pkg-config --cflags glib-2.0)
+
 msg_send: LDLIBS+=$(shell ncurses5-config --libs)
 
 msgg: msgg.o message.o client.o
