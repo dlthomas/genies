@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs::remove_file,
     process::Output,
     sync::{Arc, Mutex},
 };
@@ -14,6 +15,7 @@ use tokio::{
 pub enum Request {
     Poll(GenieCookie),
     Get(GenieCookie),
+    Exit,
 }
 
 mod parse {
@@ -49,8 +51,13 @@ mod parse {
         Ok((i, Request::Get(cookie)))
     }
 
+    fn exit_request(i: &[u8]) -> IResult<&[u8], Request> {
+        let (i, _) = tag("exit\n")(i)?;
+        Ok((i, Request::Exit))
+    }
+
     pub fn request(i: &[u8]) -> IResult<&[u8], Request> {
-        alt((poll_request, get_request))(i)
+        alt((poll_request, get_request, exit_request))(i)
     }
 }
 
@@ -128,10 +135,10 @@ async fn main() {
 
     {
         let state = state.clone();
-        let mut listener = UnixListener::bind(socket_path).unwrap();
+        let mut listener = UnixListener::bind(&socket_path).unwrap();
         tokio::spawn(async move {
-            loop {
-                while let Some(Ok(mut stream)) = listener.next().await {
+            'top: loop {
+                if let Some(Ok(mut stream)) = listener.next().await {
                     let mut nbytes = 0;
                     let mut buffer: [u8; 8192] = [0; 8192];
                     'stream: loop {
@@ -158,6 +165,7 @@ async fn main() {
                                                 send_output_to_stream(&mut stream, &output).await
                                             }
                                         }
+                                        Request::Exit => break 'top,
                                     }
                                     break 'stream;
                                 }
@@ -168,6 +176,13 @@ async fn main() {
                     }
                 }
             }
+
+            match remove_file(socket_path) {
+                Err(_) => (),
+                Ok(_) => (),
+            }
+
+            std::process::exit(0)
         });
     }
 
