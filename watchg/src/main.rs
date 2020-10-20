@@ -113,11 +113,17 @@ async fn send_output_to_stream(stream: &mut UnixStream, output: &Output) {
     }
 }
 
+
+
 #[tokio::main]
 async fn main() {
     let state = Arc::new(Mutex::new(WatchState::new()));
     let name = "watch";
-    let socket_path = ".watch.sock";
+    let socket_name = format!(".{}", name);
+    let genie_dir = ".";
+    let socket_path = {
+      format!("{}/{}.{:x}.sock", genie_dir, socket_name, rand::random::<u32>())
+    };
     print!("{}\n{}\n", name, socket_path);
 
     {
