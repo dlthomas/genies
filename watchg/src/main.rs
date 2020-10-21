@@ -12,6 +12,8 @@ use tokio::{
     stream::StreamExt,
 };
 
+use conf::{configure, Config};
+
 pub enum Request {
     Poll(GenieCookie),
     Get(GenieCookie),
@@ -120,17 +122,65 @@ async fn send_output_to_stream(stream: &mut UnixStream, output: &Output) {
     }
 }
 
+mod conf {
+    use clap::{App, AppSettings, Arg};
 
+    pub struct Config {
+        pub name: String,
+        pub socket_path: String,
+        pub command: String,
+        pub interval: u64, // milliseconds
+    }
+
+    pub fn configure() -> Config {
+        let matches = App::new("watchg")
+            .setting(AppSettings::TrailingVarArg)
+            .author("David L. L. Thomas <davidleothomas@gmail.com>")
+            .about("execute a program periodically, make its output available as a genie")
+            .arg(
+                Arg::with_name("interval")
+                    .short("n")
+                    .long("interval")
+                    .takes_value(true)
+                    .value_name("seconds"),
+            )
+            .arg(Arg::from_usage("<cmd>... 'command to run'"))
+            .get_matches();
+
+        let name = "watch".to_string();
+        let genie_dir = ".";
+        let socket_path = { format!("{}/.{}.{:x}.sock", genie_dir, name, rand::random::<u32>()) };
+
+        let command = matches
+            .values_of("cmd")
+            .unwrap()
+            .collect::<Vec<&str>>()
+            .join(" ");
+
+        let interval = match matches.value_of("interval") {
+            None => 2.0,
+            Some(string) => string.parse().unwrap(),
+        };
+        let interval = (1000.0 * interval) as u64;
+
+        Config {
+            name,
+            socket_path,
+            command,
+            interval,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
+    let Config {
+        name,
+        socket_path,
+        command,
+        interval,
+    } = configure();
     let state = Arc::new(Mutex::new(WatchState::new()));
-    let name = "watch";
-    let socket_name = format!(".{}", name);
-    let genie_dir = ".";
-    let socket_path = {
-      format!("{}/{}.{:x}.sock", genie_dir, socket_name, rand::random::<u32>())
-    };
     print!("{}\n{}\n", name, socket_path);
 
     {
@@ -186,12 +236,6 @@ async fn main() {
         });
     }
 
-    let command = std::env::args()
-        .into_iter()
-        .skip(1)
-        .collect::<Vec<String>>()
-        .join(" ");
-
     let mut iteration = 0;
 
     loop {
@@ -204,7 +248,7 @@ async fn main() {
 
         state.lock().unwrap().update(iteration, &output);
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(interval));
         iteration += 1;
     }
 }

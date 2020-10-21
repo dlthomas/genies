@@ -10,3 +10,4 @@ edition = "2018"
 tokio = { version = "0.3", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "stream"] }
 nom = "5.1.2"
 rand = "0.7.3"
+clap = "2.33.3"
