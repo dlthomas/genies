@@ -1,0 +1,15 @@
+[package]
+name = "tscg"
+version = "0.1.0"
+authors = ["David L. L. Thomas <davidleothomas@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.3", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "stream"] }
+regex = "1.4.1"
+nom = "5.1.2"
+rand = "0.7.3"
+clap = "2.33.3"
+libc = "0.2.80"
