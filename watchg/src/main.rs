@@ -112,7 +112,14 @@ impl WatchState {
     }
 }
 
-async fn send_output_to_stream(stream: &mut UnixStream, output: &Output) {
+async fn send_output_to_stream(stream: &mut UnixStream, output: &Output, beep: bool) {
+    if beep {
+        match output.status.code() {
+            Some(0) => (),
+            None | Some(_) => stream.write_all(&[0o007]).await.unwrap(),
+        }
+    }
+
     if output.stderr.len() > 0 {
         stream.write_all(&output.stderr).await.unwrap()
     }
@@ -130,6 +137,7 @@ mod conf {
         pub socket_path: String,
         pub command: String,
         pub interval: u64, // milliseconds
+        pub beep: bool,
     }
 
     pub fn configure() -> Config {
@@ -144,6 +152,7 @@ mod conf {
                     .takes_value(true)
                     .value_name("seconds"),
             )
+            .arg(Arg::with_name("beep").short("b").long("beep"))
             .arg(Arg::from_usage("<cmd>... 'command to run'"))
             .get_matches();
 
@@ -163,11 +172,14 @@ mod conf {
         };
         let interval = (1000.0 * interval) as u64;
 
+        let beep = matches.is_present("beep");
+
         Config {
             name,
             socket_path,
             command,
             interval,
+            beep,
         }
     }
 }
@@ -179,6 +191,7 @@ async fn main() {
         socket_path,
         command,
         interval,
+        beep,
     } = configure();
     let state = Arc::new(Mutex::new(WatchState::new()));
     print!("{}\n{}\n", name, socket_path);
@@ -206,13 +219,15 @@ async fn main() {
                                         Request::Poll(cookie) => {
                                             let output = state.lock().unwrap().poll(cookie).clone();
                                             if let Some(output) = output {
-                                                send_output_to_stream(&mut stream, &output).await
+                                                send_output_to_stream(&mut stream, &output, beep)
+                                                    .await
                                             }
                                         }
                                         Request::Get(cookie) => {
                                             let output = state.lock().unwrap().get(cookie).clone();
                                             if let Some(output) = output {
-                                                send_output_to_stream(&mut stream, &output).await
+                                                send_output_to_stream(&mut stream, &output, false)
+                                                    .await
                                             }
                                         }
                                         Request::Exit => break 'top,
