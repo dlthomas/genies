@@ -141,12 +141,12 @@ async fn send_output_to_stream(stream: &mut UnixStream, output: &Option<Arc<(u16
                 stream.write_all(output.1.as_bytes()).await.unwrap()
             } else {
                 stream
-                    .write_all("... no output ...".as_bytes())
+                    .write_all("... no output ...\n".as_bytes())
                     .await
                     .unwrap()
             }
         }
-        None => stream.write_all("compiling...".as_bytes()).await.unwrap(),
+        None => stream.write_all("compiling...\n".as_bytes()).await.unwrap(),
     }
 }
 
@@ -297,13 +297,14 @@ async fn main() {
                 if let Some(captures) = end.captures(&line) {
                     let error_count = captures.get(1).unwrap().as_str().parse().unwrap();
 
-                    let output = output.drain(..).collect::<Vec<String>>().join("\n");
+                    let mut output = output.drain(..).collect::<Vec<String>>().join("\n");
+                    output.push('\n');
                     state.lock().unwrap().update(iteration, Some((error_count, output)))
                 }
             }
 
             Err(line) => {
-                output.push(format!("err: {}", line.to_string()));
+                output.push(format!("err: {}\n", line.to_string()));
             }
         }
 
