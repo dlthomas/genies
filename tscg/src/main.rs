@@ -283,7 +283,7 @@ async fn main() {
     )
     .unwrap();
 
-    let end = regex::Regex::new("Found ([0-9]+) errors. Watching for file changes.").unwrap();
+    let end = regex::Regex::new("Found ([0-9]+) errors?. Watching for file changes.").unwrap();
 
     loop {
         match input.next().await.unwrap() {
