@@ -21,17 +21,6 @@ pub enum Request {
     Exit,
 }
 
-fn setpgrp() -> io::Result<()> {
-    let ret = unsafe {
-        libc::setpgid(0, 0)
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 mod parse {
     use super::{GenieCookie, Request};
     use nom::{
@@ -154,9 +143,10 @@ mod conf {
     use clap::{App, AppSettings, Arg};
 
     pub struct Config {
+        pub genie_dir: String,
         pub name: String,
-        pub socket_path: String,
         pub args: Vec<String>,
+        pub logfile: Option<String>,
     }
 
     pub fn configure() -> Config {
@@ -167,8 +157,15 @@ mod conf {
             .get_matches();
 
         let name = "tsc".to_string();
-        let genie_dir = ".";
-        let socket_path = { format!("{}/.{}.{:x}.sock", genie_dir, name, rand::random::<u32>()) };
+        let genie_dir = std::env::var("GENIE_PATH")
+            .ok()
+            .expect("GENIE_PATH env var is not set")
+            .split(":")
+            .next()
+            .unwrap()
+            .to_string();
+
+        let logfile = matches.value_of("logfile").map(String::from);
 
         let args = matches
             .values_of("arg")
@@ -177,137 +174,176 @@ mod conf {
             .collect();
 
         Config {
+            genie_dir,
             name,
-            socket_path,
             args,
+            logfile,
         }
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let Config {
+        genie_dir,
         name,
-        socket_path,
         args,
+        logfile,
     } = configure();
     let state = Arc::new(Mutex::new(TscState::new()));
-    print!("{}\n{}\n", name, socket_path);
 
-    setpgrp().expect("failed to set process group for genie");
+    let daemonize = daemonize::Daemonize::new().working_directory(".");
 
-    {
-        let state = state.clone();
-        let mut listener = UnixListener::bind(&socket_path).unwrap();
-        tokio::spawn(async move {
-            'top: loop {
-                if let Some(Ok(mut stream)) = listener.next().await {
-                    let mut nbytes = 0;
-                    let mut buffer: [u8; 8192] = [0; 8192];
-                    'stream: loop {
-                        match stream.read(&mut buffer[nbytes..]).await {
-                            Ok(0) => break,
-                            Ok(length) => nbytes += length,
-                            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(_err) => break 'stream,
-                        }
+    let daemonize = match logfile {
+        Some(logfile) => {
+            let logfile = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(logfile)
+                .expect("unable to open logfile");
 
-                        loop {
-                            match parse::request(&buffer[..nbytes]) {
-                                Ok((_, request)) => {
-                                    match request {
-                                        Request::Poll(cookie) => {
-                                            let output = state.lock().unwrap().poll(cookie).clone();
-                                            if let Some(output) = output {
-                                                send_error_count_to_stream(&mut stream, &output).await
-                                            }
-                                        }
-                                        Request::Get(cookie) => {
-                                            let output = state.lock().unwrap().get(cookie).clone();
-                                            if let Some(output) = output {
-                                                send_output_to_stream(&mut stream, &output).await
-                                            }
-                                        }
-                                        Request::Exit => break 'top,
+            let stdout = logfile.try_clone().expect("unable to clone logfile handle");
+            let stderr = logfile;
+
+            daemonize.stdout(stdout).stderr(stderr)
+        }
+        None => daemonize,
+    };
+
+    daemonize.start().expect("failed to daemonize");
+
+    let socket_path = { format!("{}/{}.{:x}.sock", genie_dir, name, std::process::id()) };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            {
+                let state = state.clone();
+                let mut listener = UnixListener::bind(&socket_path).unwrap();
+                tokio::spawn(async move {
+                    'top: loop {
+                        if let Some(Ok(mut stream)) = listener.next().await {
+                            let mut nbytes = 0;
+                            let mut buffer: [u8; 8192] = [0; 8192];
+                            'stream: loop {
+                                match stream.read(&mut buffer[nbytes..]).await {
+                                    Ok(0) => break,
+                                    Ok(length) => nbytes += length,
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                        continue
                                     }
-                                    break 'stream;
+                                    Err(_err) => break 'stream,
                                 }
-                                Err(nom::Err::Incomplete(_)) => continue 'stream,
-                                Err(_) => break 'stream,
+
+                                loop {
+                                    match parse::request(&buffer[..nbytes]) {
+                                        Ok((_, request)) => {
+                                            match request {
+                                                Request::Poll(cookie) => {
+                                                    let output =
+                                                        state.lock().unwrap().poll(cookie).clone();
+                                                    if let Some(output) = output {
+                                                        send_error_count_to_stream(
+                                                            &mut stream,
+                                                            &output,
+                                                        )
+                                                        .await
+                                                    }
+                                                }
+                                                Request::Get(cookie) => {
+                                                    let output =
+                                                        state.lock().unwrap().get(cookie).clone();
+                                                    if let Some(output) = output {
+                                                        send_output_to_stream(&mut stream, &output)
+                                                            .await
+                                                    }
+                                                }
+                                                Request::Exit => break 'top,
+                                            }
+                                            break 'stream;
+                                        }
+                                        Err(nom::Err::Incomplete(_)) => continue 'stream,
+                                        Err(_) => break 'stream,
+                                    }
+                                }
                             }
                         }
                     }
-                }
+
+                    match remove_file(socket_path) {
+                        Err(_) => (),
+                        Ok(_) => (),
+                    }
+
+                    std::process::exit(0)
+                });
             }
 
-            match remove_file(socket_path) {
-                Err(_) => (),
-                Ok(_) => (),
-            }
+            let mut iteration: u32 = 0;
 
-            std::process::exit(0)
-        });
-    }
+            let tsc: Child = args
+                .into_iter()
+                .fold(Command::new("tsc").arg("--watch"), |tsc, arg| tsc.arg(arg))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("faild to spawn tsc process");
 
-    let mut iteration: u32 = 0;
+            let stdout = tsc
+                .stdout
+                .expect("stdout from child process was unavailable");
+            let stdout = BufReader::new(stdout);
+            let stdout = stdout.lines().map(Result::unwrap).map(Ok);
 
-    let tsc: Child = args
-        .into_iter()
-        .fold(Command::new("tsc").arg("--watch"), |tsc, arg| tsc.arg(arg))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("faild to spawn tsc process");
+            let stderr = tsc
+                .stderr
+                .expect("stderr from child process was unavailable");
+            let stderr = BufReader::new(stderr);
+            let stderr = stderr.lines().map(Result::unwrap).map(Err);
 
-    let stdout = tsc
-        .stdout
-        .expect("stdout from child process was unavailable");
-    let stdout = BufReader::new(stdout);
-    let stdout = stdout.lines().map(Result::unwrap).map(Ok);
+            let mut input = stdout.merge(stderr);
 
-    let stderr = tsc
-        .stderr
-        .expect("stderr from child process was unavailable");
-    let stderr = BufReader::new(stderr);
-    let stderr = stderr.lines().map(Result::unwrap).map(Err);
+            let mut output = Vec::new();
 
-    let mut input = stdout.merge(stderr);
-
-    let mut output = Vec::new();
-
-    let start = regex::Regex::new(
-        "Starting compilation in watch mode...\
+            let start = regex::Regex::new(
+                "Starting compilation in watch mode...\
         |File change detected. Starting incremental compilation...",
-    )
-    .unwrap();
+            )
+            .unwrap();
 
-    let end = regex::Regex::new("Found ([0-9]+) errors?. Watching for file changes.").unwrap();
+            let end =
+                regex::Regex::new("Found ([0-9]+) errors?. Watching for file changes.").unwrap();
 
-    loop {
-        match input.next().await.unwrap() {
-            Ok(line) => {
-                if start.is_match(&line) {
-                    state.lock().unwrap().update(iteration, None)
+            loop {
+                match input.next().await.unwrap() {
+                    Ok(line) => {
+                        if start.is_match(&line) {
+                            state.lock().unwrap().update(iteration, None)
+                        }
+
+                        output.push(line.to_string());
+
+                        if let Some(captures) = end.captures(&line) {
+                            let error_count = captures.get(1).unwrap().as_str().parse().unwrap();
+
+                            let mut output = output.drain(..).collect::<Vec<String>>().join("\n");
+                            output.push('\n');
+                            state
+                                .lock()
+                                .unwrap()
+                                .update(iteration, Some((error_count, output)))
+                        }
+                    }
+
+                    Err(line) => {
+                        output.push(format!("err: {}\n", line.to_string()));
+                    }
                 }
 
-                output.push(line.to_string());
-
-                if let Some(captures) = end.captures(&line) {
-                    let error_count = captures.get(1).unwrap().as_str().parse().unwrap();
-
-                    let mut output = output.drain(..).collect::<Vec<String>>().join("\n");
-                    output.push('\n');
-                    state.lock().unwrap().update(iteration, Some((error_count, output)))
-                }
+                iteration += 1;
             }
-
-            Err(line) => {
-                output.push(format!("err: {}\n", line.to_string()));
-            }
-        }
-
-        iteration += 1;
-    }
+        });
 }

@@ -13,3 +13,5 @@ nom = "5.1.2"
 rand = "0.7.3"
 clap = "2.33.3"
 libc = "0.2.80"
+daemonize = "0.4.1"
+genie = { path = "../genie" }
