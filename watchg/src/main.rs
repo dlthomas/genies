@@ -133,11 +133,12 @@ mod conf {
     use clap::{App, AppSettings, Arg};
 
     pub struct Config {
+        pub genie_dir: String,
         pub name: String,
-        pub socket_path: String,
         pub command: String,
         pub interval: u64, // milliseconds
         pub beep: bool,
+        pub logfile: Option<String>,
     }
 
     pub fn configure() -> Config {
@@ -154,11 +155,20 @@ mod conf {
             )
             .arg(Arg::with_name("beep").short("b").long("beep"))
             .arg(Arg::from_usage("<cmd>... 'command to run'"))
+            .arg(
+                Arg::with_name("logfile")
+                    .short("l")
+                    .long("logfile")
+                    .takes_value(true)
+                    .value_name("file"),
+            )
             .get_matches();
 
         let name = "watch".to_string();
-        let genie_dir = ".";
-        let socket_path = { format!("{}/.{}.{:x}.sock", genie_dir, name, rand::random::<u32>()) };
+        let path = std::env::var("GENIE_PATH")
+            .ok()
+            .expect("GENIE_PATH env var is not set");
+        let genie_dir = path.split(":").next().unwrap().to_string();
 
         let command = matches
             .values_of("cmd")
@@ -174,96 +184,138 @@ mod conf {
 
         let beep = matches.is_present("beep");
 
+        let logfile = matches.value_of("logfile").map(String::from);
+
         Config {
+            genie_dir,
             name,
-            socket_path,
             command,
             interval,
             beep,
+            logfile,
         }
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let Config {
+        genie_dir,
         name,
-        socket_path,
         command,
         interval,
         beep,
+        logfile,
     } = configure();
     let state = Arc::new(Mutex::new(WatchState::new()));
-    print!("{}\n{}\n", name, socket_path);
 
-    {
-        let state = state.clone();
-        let mut listener = UnixListener::bind(&socket_path).unwrap();
-        tokio::spawn(async move {
-            'top: loop {
-                if let Some(Ok(mut stream)) = listener.next().await {
-                    let mut nbytes = 0;
-                    let mut buffer: [u8; 8192] = [0; 8192];
-                    'stream: loop {
-                        match stream.read(&mut buffer[nbytes..]).await {
-                            Ok(0) => break,
-                            Ok(length) => nbytes += length,
-                            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(_err) => break 'stream,
-                        }
+    let daemonize = daemonize::Daemonize::new().working_directory(".");
 
-                        loop {
-                            match parse::request(&buffer[..nbytes]) {
-                                Ok((_, request)) => {
-                                    match request {
-                                        Request::Poll(cookie) => {
-                                            let output = state.lock().unwrap().poll(cookie).clone();
-                                            if let Some(output) = output {
-                                                send_output_to_stream(&mut stream, &output, beep)
-                                                    .await
-                                            }
-                                        }
-                                        Request::Get(cookie) => {
-                                            let output = state.lock().unwrap().get(cookie).clone();
-                                            if let Some(output) = output {
-                                                send_output_to_stream(&mut stream, &output, false)
-                                                    .await
-                                            }
-                                        }
-                                        Request::Exit => break 'top,
+    let daemonize = match logfile {
+        Some(logfile) => {
+            let logfile = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(logfile)
+                .expect("unable to open logfile");
+
+            let stdout = logfile.try_clone().expect("unable to clone logfile handle");
+            let stderr = logfile;
+
+            daemonize.stdout(stdout).stderr(stderr)
+        }
+        None => daemonize,
+    };
+
+    daemonize.start().expect("failed to daemonize");
+
+    let socket_path = { format!("{}/{}.{:x}.sock", genie_dir, name, std::process::id()) };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            {
+                let state = state.clone();
+                let mut listener = UnixListener::bind(&socket_path).unwrap();
+                tokio::spawn(async move {
+                    'top: loop {
+                        if let Some(Ok(mut stream)) = listener.next().await {
+                            let mut nbytes = 0;
+                            let mut buffer: [u8; 8192] = [0; 8192];
+                            'stream: loop {
+                                match stream.read(&mut buffer[nbytes..]).await {
+                                    Ok(0) => break,
+                                    Ok(length) => nbytes += length,
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                        continue
                                     }
-                                    break 'stream;
+                                    Err(_err) => break 'stream,
                                 }
-                                Err(nom::Err::Incomplete(_)) => continue 'stream,
-                                Err(_) => break 'stream,
+
+                                loop {
+                                    match parse::request(&buffer[..nbytes]) {
+                                        Ok((_, request)) => {
+                                            match request {
+                                                Request::Poll(cookie) => {
+                                                    let output =
+                                                        state.lock().unwrap().poll(cookie).clone();
+                                                    if let Some(output) = output {
+                                                        send_output_to_stream(
+                                                            &mut stream,
+                                                            &output,
+                                                            beep,
+                                                        )
+                                                        .await
+                                                    }
+                                                }
+                                                Request::Get(cookie) => {
+                                                    let output =
+                                                        state.lock().unwrap().get(cookie).clone();
+                                                    if let Some(output) = output {
+                                                        send_output_to_stream(
+                                                            &mut stream,
+                                                            &output,
+                                                            false,
+                                                        )
+                                                        .await
+                                                    }
+                                                }
+                                                Request::Exit => break 'top,
+                                            }
+                                            break 'stream;
+                                        }
+                                        Err(nom::Err::Incomplete(_)) => continue 'stream,
+                                        Err(_) => break 'stream,
+                                    }
+                                }
                             }
                         }
                     }
-                }
+
+                    match remove_file(socket_path) {
+                        Err(_) => (),
+                        Ok(_) => (),
+                    }
+
+                    std::process::exit(0)
+                });
             }
 
-            match remove_file(socket_path) {
-                Err(_) => (),
-                Ok(_) => (),
-            }
+            let mut iteration = 0;
 
-            std::process::exit(0)
+            loop {
+                let output: Output = Command::new("bash")
+                    .arg("-c")
+                    .arg(command.clone())
+                    .output()
+                    .await
+                    .unwrap();
+
+                state.lock().unwrap().update(iteration, &output);
+
+                std::thread::sleep(std::time::Duration::from_millis(interval));
+                iteration += 1;
+            }
         });
-    }
-
-    let mut iteration = 0;
-
-    loop {
-        let output: Output = Command::new("bash")
-            .arg("-c")
-            .arg(command.clone())
-            .output()
-            .await
-            .unwrap();
-
-        state.lock().unwrap().update(iteration, &output);
-
-        std::thread::sleep(std::time::Duration::from_millis(interval));
-        iteration += 1;
-    }
 }
