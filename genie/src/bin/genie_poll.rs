@@ -15,7 +15,7 @@ fn main() {
     let cyan = "\x1b[36m";
     let white = "\x1b[37m";
 
-    let re = regex::Regex::new(r"([a-z0-9]+)\.([a-z0-9]+)\.sock").unwrap();
+    let re = regex::Regex::new(genie::SOCKNAME_PATTERN).unwrap();
 
     let mut header_printed = false;
 
